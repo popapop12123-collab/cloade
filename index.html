@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Диктофон → MP3</title>
+<style>
+  :root { --bg:#f6f5f1; --fg:#1d1d1b; --card:#fff; --accent:#d94f30; --muted:#6b6b66; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161615; --fg:#f0efe9; --card:#222220; --muted:#9a9a93; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
+         font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding:16px; }
+  .card { background:var(--card); border-radius:20px; padding:28px; width:100%; max-width:420px;
+          box-shadow:0 4px 24px rgba(0,0,0,.08); text-align:center; }
+  h1 { font-size:1.3rem; margin:0 0 20px; }
+  #timer { font-size:3rem; font-variant-numeric:tabular-nums; margin:12px 0; }
+  canvas { width:100%; height:60px; display:block; margin-bottom:16px; }
+  button { font:inherit; border:0; border-radius:999px; padding:12px 24px; cursor:pointer; margin:4px; }
+  #rec { background:var(--accent); color:#fff; font-weight:600; }
+  #rec.on { animation:pulse 1.2s infinite; }
+  #dl { background:var(--fg); color:var(--bg); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  audio { width:100%; margin-top:16px; }
+  #status { color:var(--muted); font-size:.9rem; min-height:1.4em; margin-top:12px; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 10px rgba(217,79,48,.25); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎙 Диктофон → MP3</h1>
+  <canvas id="viz" width="400" height="60"></canvas>
+  <div id="timer">00:00</div>
+  <button id="rec">● Запись</button>
+  <button id="dl" disabled>⬇ Скачать MP3</button>
+  <audio id="player" controls hidden></audio>
+  <div id="status">Нажми «Запись» и разреши доступ к микрофону</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const recBtn = $('rec'), dlBtn = $('dl'), player = $('player'), statusEl = $('status'), timerEl = $('timer');
+const canvas = $('viz'), ctx2d = canvas.getContext('2d');
+
+let mediaRecorder, chunks = [], stream, audioCtx, analyser, rafId, tickId, startTime, blob, mp3Blob;
+
+function fmt(s) { const m = Math.floor(s/60), r = Math.floor(s%60); return String(m).padStart(2,'0')+':'+String(r).padStart(2,'0'); }
+
+function draw() {
+  const data = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteTimeDomainData(data);
+  const w = canvas.width, h = canvas.height;
+  ctx2d.clearRect(0,0,w,h);
+  ctx2d.lineWidth = 2; ctx2d.strokeStyle = '#d94f30'; ctx2d.beginPath();
+  data.forEach((v,i) => { const x = i/data.length*w, y = v/255*h; i ? ctx2d.lineTo(x,y) : ctx2d.moveTo(x,y); });
+  ctx2d.stroke();
+  rafId = requestAnimationFrame(draw);
+}
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    statusEl.textContent = 'Нет доступа к микрофону: ' + e.message;
+    return;
+  }
+  chunks = []; mp3Blob = null; dlBtn.disabled = true; player.hidden = true;
+  mediaRecorder = new MediaRecorder(stream);
+  mediaRecorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+  mediaRecorder.onstop = onStop;
+  mediaRecorder.start();
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioCtx.createAnalyser();
+  audioCtx.createMediaStreamSource(stream).connect(analyser);
+  draw();
+
+  startTime = Date.now();
+  tickId = setInterval(() => timerEl.textContent = fmt((Date.now()-startTime)/1000), 250);
+  recBtn.textContent = '■ Стоп'; recBtn.classList.add('on');
+  statusEl.textContent = 'Идёт запись…';
+}
+
+function stop() {
+  mediaRecorder.stop();
+  stream.getTracks().forEach(t => t.stop());
+  cancelAnimationFrame(rafId); clearInterval(tickId);
+  audioCtx.close();
+  recBtn.textContent = '● Запись'; recBtn.classList.remove('on');
+}
+
+async function onStop() {
+  blob = new Blob(chunks, { type: mediaRecorder.mimeType });
+  player.src = URL.createObjectURL(blob); player.hidden = false;
+  statusEl.textContent = 'Конвертирую в MP3…';
+  try {
+    mp3Blob = await toMp3(blob);
+    dlBtn.disabled = false;
+    statusEl.textContent = 'Готово! Можно слушать и скачивать (' + (mp3Blob.size/1024).toFixed(0) + ' КБ)';
+  } catch (e) {
+    statusEl.textContent = 'Ошибка конвертации в MP3: ' + e.message;
+  }
+}
+
+async function toMp3(b) {
+  if (typeof lamejs === 'undefined') throw new Error('не загрузилась библиотека lamejs (нужен интернет)');
+  const ac = new AudioContext();
+  const buf = await ac.decodeAudioData(await b.arrayBuffer());
+  await ac.close();
+  const f = buf.getChannelData(0);
+  const pcm = new Int16Array(f.length);
+  for (let i = 0; i < f.length; i++) { const s = Math.max(-1, Math.min(1, f[i])); pcm[i] = s < 0 ? s*0x8000 : s*0x7FFF; }
+  const enc = new lamejs.Mp3Encoder(1, buf.sampleRate, 128);
+  const out = [], step = 1152;
+  for (let i = 0; i < pcm.length; i += step) {
+    const d = enc.encodeBuffer(pcm.subarray(i, i+step));
+    if (d.length) out.push(new Uint8Array(d));
+  }
+  const end = enc.flush();
+  if (end.length) out.push(new Uint8Array(end));
+  return new Blob(out, { type: 'audio/mpeg' });
+}
+
+recBtn.onclick = () => (mediaRecorder && mediaRecorder.state === 'recording') ? stop() : start();
+
+dlBtn.onclick = () => {
+  if (!mp3Blob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(mp3Blob);
+  a.download = 'запись-' + new Date().toISOString().slice(0,19).replace(/[:T]/g,'-') + '.mp3';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+</script>
+</body>
+</html>
